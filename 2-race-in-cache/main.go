@@ -10,6 +10,7 @@ package main
 
 import (
 	"container/list"
+	"sync" 
 	"testing"
 )
 
@@ -29,6 +30,7 @@ type page struct {
 
 // KeyStoreCache is a LRU cache for string key-value pairs
 type KeyStoreCache struct {
+	mu    sync.RWMutex
 	cache map[string]*list.Element
 	pages list.List
 	load  func(string) string
@@ -44,12 +46,35 @@ func New(load KeyStoreCacheLoader) *KeyStoreCache {
 
 // Get gets the key from cache, loads it from the source if needed
 func (k *KeyStoreCache) Get(key string) string {
+	// initial read lock
+	k.mu.RLock()
 	if e, ok := k.cache[key]; ok {
+		// if cache hit, unlock read lock then upgrade to write lock for 'MoveToFront' func
+		// since we're gonna move an element. list.List methods are not thread safe
+		k.mu.RUnlock()
+		
+		k.mu.Lock()
+		k.pages.MoveToFront(e)
+		k.mu.Unlock()
+
+		return e.Value.(page).Value
+	}
+	k.mu.RUnlock()
+
+	// if cache miss then we're writing to we're gonna write lock
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	// key might have been loaded by another goroutine so we check again while this goroutine is waiting for the lock.
+	if e, ok := k.cache[key]; ok {	// Key was loaded by another goroutine, just move it to front and return.
 		k.pages.MoveToFront(e)
 		return e.Value.(page).Value
 	}
+
 	// Miss - load from database and save it in cache
+	// this is the expensive operation we are protecting against with the double check.
 	p := page{key, k.load(key)}
+	
 	// if cache is full remove the least used item
 	if len(k.cache) >= CacheSize {
 		end := k.pages.Back()
@@ -58,8 +83,10 @@ func (k *KeyStoreCache) Get(key string) string {
 		// remove from list
 		k.pages.Remove(end)
 	}
+
 	k.pages.PushFront(p)
 	k.cache[key] = k.pages.Front()
+	
 	return p.Value
 }
 
